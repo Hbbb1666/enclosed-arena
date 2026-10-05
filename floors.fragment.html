@@ -1,0 +1,631 @@
+<div id="plans-root">
+<style>
+#plans-root .plans-stage{position:relative;width:100%;aspect-ratio:16/10;min-height:240px;max-height:520px;overflow:hidden}
+#plans-root .plans-stage canvas{display:block;width:100%;height:100%;touch-action:none}
+#plans-root .plans-tip{position:absolute;left:0;top:0;transform:translate(-50%,-135%);pointer-events:none;background:var(--popover);color:var(--popover-foreground);padding:3px 9px;border-radius:6px;font-size:12px;line-height:1.5;white-space:nowrap;opacity:0;transition:opacity .12s ease;z-index:3}
+#plans-root .plans-tip em{font-style:normal;color:var(--muted-foreground);margin-left:6px}
+#plans-root .plans-stack{display:flex;flex-direction:column;gap:8px;margin-top:8px}
+#plans-root .plans-legend{margin:0}
+</style>
+<div class="plans-stage" id="plans-stage">
+<canvas id="plans-canvas" role="img" aria-label="公寓楼层分解模型：一层大堂、宴会厅、图书室、医务室、厨房储藏、放映厅、健身房泳池与客房层的分体平面"></canvas>
+<div class="plans-tip" id="plans-tip" aria-hidden="true"></div>
+</div>
+<div class="plans-stack">
+<div class="viz-controls" role="group" aria-label="楼层">
+<button class="btn btn-primary" type="button" data-plans-floor="-1" aria-pressed="true">全部楼层</button>
+<button class="btn" type="button" data-plans-floor="0" aria-pressed="false">1F 大堂</button>
+<button class="btn" type="button" data-plans-floor="1" aria-pressed="false">2F 宴会厅</button>
+<button class="btn" type="button" data-plans-floor="2" aria-pressed="false">3F 图书室</button>
+<button class="btn" type="button" data-plans-floor="3" aria-pressed="false">4F 医务室</button>
+<button class="btn" type="button" data-plans-floor="4" aria-pressed="false">5F 厨房</button>
+<button class="btn" type="button" data-plans-floor="5" aria-pressed="false">6F 放映厅</button>
+<button class="btn" type="button" data-plans-floor="6" aria-pressed="false">7F 健身泳池</button>
+<button class="btn" type="button" data-plans-floor="7" aria-pressed="false">12F 客房层</button>
+</div>
+<div class="viz-controls" role="group" aria-label="显示">
+<button class="btn" type="button" data-plans-toggle="props" aria-pressed="true">家具陈设</button>
+<button class="btn" type="button" data-plans-toggle="labels" aria-pressed="true">楼层标签</button>
+<button class="btn" type="button" data-plans-toggle="grid" aria-pressed="true">地面网格</button>
+<button class="btn" type="button" data-plans-toggle="spin" aria-pressed="false">自动旋转</button>
+</div>
+<p class="text-small text-muted plans-legend" id="plans-legend">八块楼板均为示意布局，尺寸统一缩小、不按等比。点楼层按钮或直接点楼板，即可把那一层单独抽出来看。</p>
+<p class="sr-only" id="plans-desc">公寓内部按层拆开的示意模型。一层大堂前厅，二层宴会厅餐厅，三层图书室，四层医务室与观察室，五层厨房与冷库储藏，六层放映厅与游戏室，七层健身房与泳池，十二层为代表客房层，环廊两侧各一套客房并带挑出外立面的露台。每层都是方形环板，中央留出贯通全楼的中庭。</p>
+</div>
+<script src="https://cdn.jsdelivr.net/npm/three@0.140.0/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.140.0/examples/js/controls/OrbitControls.js"></script>
+<script>
+(function () {
+'use strict';
+var root = document.getElementById('plans-root');
+var stage = document.getElementById('plans-stage');
+var canvas = document.getElementById('plans-canvas');
+var tipEl = document.getElementById('plans-tip');
+var legendEl = document.getElementById('plans-legend');
+if (!root || !stage || !canvas) return;
+if (!window.THREE) {
+canvas.style.display = 'none';
+legendEl.textContent = '三维引擎未能加载，检查网络后刷新即可。';
+return;
+}
+var THREE = window.THREE;
+var reduceMotion = !!(window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+function cssVar(name, fallback) {
+var probe = document.createElement('span');
+probe.setAttribute('style', 'position:absolute;left:-9999px;top:-9999px;background-color:var(' + name + ')');
+root.appendChild(probe);
+var value = window.getComputedStyle(probe).backgroundColor;
+probe.parentNode.removeChild(probe);
+if (!value || value === 'rgba(0, 0, 0, 0)' || value === 'transparent') return fallback;
+return value;
+}
+var THEME = { bg: cssVar('--background', '#ffffff'), fg: cssVar('--foreground', '#141414') };
+var bgColor = new THREE.Color(THEME.bg);
+var darkTheme = bgColor.getHSL({ h: 0, s: 0, l: 0 }).l < 0.5;
+var PLATE = 40, VOID = 12, WALL_H = 1.5, SLAB = 0.8;
+var HALF_P = PLATE / 2, HALF_V = VOID / 2;
+function MiniOrbit(cam, dom) {
+var self = this;
+this.target = new THREE.Vector3();
+this.autoRotate = false;
+this.autoRotateSpeed = 1;
+this.enableDamping = false;
+this.minDistance = 40;
+this.maxDistance = 1400;
+this.maxPolarAngle = Math.PI * 0.495;
+var sph = new THREE.Spherical(1, 1, 0);
+var dragging = false, panning = false, lx = 0, ly = 0;
+function read() {
+var off = new THREE.Vector3().subVectors(cam.position, self.target);
+sph.setFromVector3(off);
+if (!isFinite(sph.radius) || sph.radius < 1) sph.radius = 1;
+if (!isFinite(sph.theta)) sph.theta = 0;
+if (!isFinite(sph.phi)) sph.phi = 1;
+}
+function apply() {
+sph.radius = Math.max(self.minDistance, Math.min(self.maxDistance, sph.radius));
+sph.phi = Math.max(0.06, Math.min(self.maxPolarAngle, sph.phi));
+var off = new THREE.Vector3().setFromSpherical(sph);
+cam.position.copy(self.target).add(off);
+cam.lookAt(self.target);
+}
+this.update = function () {
+read();
+if (self.autoRotate && !dragging) sph.theta -= 0.0022 * self.autoRotateSpeed;
+apply();
+};
+dom.addEventListener('pointerdown', function (e) {
+dragging = true;
+panning = e.button === 2 || e.shiftKey;
+lx = e.clientX; ly = e.clientY;
+if (dom.setPointerCapture) dom.setPointerCapture(e.pointerId);
+});
+dom.addEventListener('pointermove', function (e) {
+if (!dragging) return;
+var dx = e.clientX - lx, dy = e.clientY - ly;
+lx = e.clientX; ly = e.clientY;
+read();
+if (panning) {
+var right = new THREE.Vector3(1, 0, 0).applyQuaternion(cam.quaternion);
+var up = new THREE.Vector3(0, 1, 0).applyQuaternion(cam.quaternion);
+self.target.addScaledVector(right, -dx * sph.radius * 0.0016);
+self.target.addScaledVector(up, dy * sph.radius * 0.0016);
+} else {
+sph.theta -= dx * 0.0062;
+sph.phi -= dy * 0.0062;
+}
+apply();
+});
+window.addEventListener('pointerup', function () { dragging = false; });
+dom.addEventListener('wheel', function (e) {
+e.preventDefault();
+read();
+sph.radius *= Math.exp(e.deltaY * 0.0012);
+apply();
+}, { passive: false });
+dom.addEventListener('contextmenu', function (e) { e.preventDefault(); });
+}
+var renderer = new THREE.WebGLRenderer({ canvas: canvas, antialias: true, alpha: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.outputEncoding = THREE.sRGBEncoding;
+var scene = new THREE.Scene();
+scene.background = new THREE.Color(THEME.bg);
+var camera = new THREE.PerspectiveCamera(42, 1.6, 0.5, 5000);
+camera.position.set(70, 185, 265);
+var Controls = THREE.OrbitControls || MiniOrbit;
+var controls = new Controls(camera, renderer.domElement);
+controls.target.set(0, 0, 0);
+if (Controls !== MiniOrbit) { controls.enableDamping = true; controls.dampingFactor = 0.08; }
+controls.minDistance = 40;
+controls.maxDistance = 1400;
+controls.maxPolarAngle = Math.PI * 0.495;
+if (controls.autoRotateSpeed !== undefined) controls.autoRotateSpeed = 0.62;
+controls.update();
+scene.add(new THREE.HemisphereLight(0xe4ecf6, 0x4b463c, 0.9));
+var key = new THREE.DirectionalLight(0xfff2de, 1.0);
+key.position.set(150, 260, 170);
+scene.add(key);
+var rim = new THREE.DirectionalLight(0xc2d6ff, 0.35);
+rim.position.set(-170, 140, -190);
+scene.add(rim);
+var MAT = {
+slab: new THREE.MeshStandardMaterial({ color: darkTheme ? 0x4c4a44 : 0xcfc7b6, roughness: 0.9, metalness: 0.02 }),
+slabTop: new THREE.MeshStandardMaterial({ color: darkTheme ? 0x5a574f : 0xe0d9c9, roughness: 0.85, metalness: 0.02 }),
+wall: new THREE.MeshStandardMaterial({ color: darkTheme ? 0x8d8578 : 0xf1ece0, roughness: 0.9, metalness: 0.0 }),
+glass: new THREE.MeshStandardMaterial({ color: 0x9fd4e8, roughness: 0.1, metalness: 0.15, transparent: true, opacity: 0.32, side: THREE.DoubleSide }),
+wood: new THREE.MeshStandardMaterial({ color: 0x8a6b45, roughness: 0.8 }),
+woodDark: new THREE.MeshStandardMaterial({ color: 0x5d452c, roughness: 0.85 }),
+metal: new THREE.MeshStandardMaterial({ color: 0x8f949c, roughness: 0.4, metalness: 0.8 }),
+dark: new THREE.MeshStandardMaterial({ color: 0x2c3138, roughness: 0.6, metalness: 0.3 }),
+cloth: new THREE.MeshStandardMaterial({ color: 0x4a6f8f, roughness: 0.95 }),
+cloth2: new THREE.MeshStandardMaterial({ color: 0x8a5560, roughness: 0.95 }),
+white: new THREE.MeshStandardMaterial({ color: 0xf2f4f5, roughness: 0.6 }),
+green: new THREE.MeshStandardMaterial({ color: 0x41703f, roughness: 1 }),
+water: new THREE.MeshStandardMaterial({ color: 0x3f9dc4, roughness: 0.12, metalness: 0.25, transparent: true, opacity: 0.85, emissive: 0x0d3f58, emissiveIntensity: 0.45 }),
+cold: new THREE.MeshStandardMaterial({ color: 0xbfe4f2, roughness: 0.2, metalness: 0.1, emissive: 0x2b7ea0, emissiveIntensity: 0.5 }),
+screen: new THREE.MeshStandardMaterial({ color: 0xf6f8fb, roughness: 0.3, emissive: 0xdce8f5, emissiveIntensity: 0.35 }),
+gold: new THREE.MeshStandardMaterial({ color: 0xcfa24c, roughness: 0.35, metalness: 0.6 }),
+tile: new THREE.MeshStandardMaterial({ color: darkTheme ? 0x6f7378 : 0xd7dade, roughness: 0.5 })
+};
+var world = new THREE.Group();
+scene.add(world);
+var plates = [];
+var pickTargets = [];
+var grid = new THREE.GridHelper(360, 36, darkTheme ? 0x5c5c5c : 0xb6b0a4, darkTheme ? 0x3c3c3c : 0xd2ccbf);
+grid.position.y = -0.6;
+grid.material.transparent = true;
+grid.material.opacity = 0.5;
+world.add(grid);
+function bx(parent, w, h, d, x, y, z, mat, ry) {
+var m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
+m.position.set(x, y, z);
+if (ry) m.rotation.y = ry;
+parent.add(m);
+return m;
+}
+function cy(parent, rTop, rBot, h, x, y, z, mat, seg) {
+var m = new THREE.Mesh(new THREE.CylinderGeometry(rTop, rBot, h, seg || 12), mat);
+m.position.set(x, y, z);
+parent.add(m);
+return m;
+}
+function ringShape(outer, inner) {
+var s = new THREE.Shape();
+var a = outer / 2;
+s.moveTo(-a, -a); s.lineTo(a, -a); s.lineTo(a, a); s.lineTo(-a, a); s.closePath();
+var b = inner / 2;
+var h = new THREE.Path();
+h.moveTo(-b, -b); h.lineTo(-b, b); h.lineTo(b, b); h.lineTo(b, -b); h.closePath();
+s.holes.push(h);
+return s;
+}
+function slabFor(parent) {
+var geo = new THREE.ExtrudeGeometry(ringShape(PLATE, VOID), { depth: SLAB, bevelEnabled: false });
+geo.rotateX(-Math.PI / 2);
+var m = new THREE.Mesh(geo, MAT.slab);
+parent.add(m);
+return m;
+}
+var STRUCT = null;
+function shell() {
+var p = STRUCT;
+var t = 0.7;
+bx(p, PLATE, WALL_H, t, 0, SLAB + WALL_H / 2, HALF_P - t / 2, MAT.wall);
+bx(p, PLATE, WALL_H, t, 0, SLAB + WALL_H / 2, -HALF_P + t / 2, MAT.wall);
+bx(p, t, WALL_H, PLATE, HALF_P - t / 2, SLAB + WALL_H / 2, 0, MAT.wall);
+bx(p, t, WALL_H, PLATE, -HALF_P + t / 2, SLAB + WALL_H / 2, 0, MAT.wall);
+var bar = 0.5;
+bx(p, VOID + 1, WALL_H * 0.5, bar, 0, SLAB + WALL_H * 0.25, -HALF_V, MAT.wall);
+bx(p, VOID + 1, WALL_H * 0.5, bar, 0, SLAB + WALL_H * 0.25, HALF_V, MAT.wall);
+bx(p, bar, WALL_H * 0.5, VOID + 1, -HALF_V, SLAB + WALL_H * 0.25, 0, MAT.wall);
+bx(p, bar, WALL_H * 0.5, VOID + 1, HALF_V, SLAB + WALL_H * 0.25, 0, MAT.wall);
+}
+function core() {
+var p = STRUCT;
+bx(p, 9, WALL_H * 1.9, 7, 0, SLAB + WALL_H * 0.95, HALF_P - 3.5, MAT.wall);
+for (var i = -1; i <= 1; i += 2) {
+bx(p, 2.4, WALL_H * 1.3, 0.3, i * 2.2, SLAB + WALL_H * 0.65, HALF_P - 7.2, MAT.metal);
+}
+for (var st = 0; st < 6; st++) {
+bx(p, 4.6, 0.25, 1.3, 0, SLAB + 0.3 + st * 0.36, HALF_P - 3.5 + (st % 2 ? 1.5 : -1.5), MAT.metal);
+}
+}
+function sofa(parent, x, z, ry, mat) {
+var g = new THREE.Group();
+g.add(bx(g, 7, 0.9, 2.6, 0, SLAB + 0.45, 0, mat));
+g.add(bx(g, 7, 1.5, 0.7, 0, SLAB + 0.75, -1.1, mat));
+g.add(bx(g, 0.7, 1.1, 2.6, -3.3, SLAB + 0.55, 0, mat));
+g.add(bx(g, 0.7, 1.1, 2.6, 3.3, SLAB + 0.55, 0, mat));
+g.position.set(x, 0, z);
+g.rotation.y = ry || 0;
+parent.add(g);
+}
+function bed(parent, x, z, ry, mat) {
+var g = new THREE.Group();
+g.add(bx(g, 6.6, 0.7, 3, 0, SLAB + 0.35, 0, MAT.woodDark));
+g.add(bx(g, 6.2, 0.5, 2.7, 0, SLAB + 0.85, 0, MAT.white));
+g.add(bx(g, 1.5, 0.35, 2.2, -2.1, SLAB + 1.2, 0, MAT.white));
+g.add(bx(g, 6.6, 1.6, 0.4, 0, SLAB + 1.1, -1.6, MAT.woodDark));
+g.position.set(x, 0, z);
+g.rotation.y = ry || 0;
+parent.add(g);
+}
+function tableSet(parent, x, z, r, chairs, mat) {
+cy(parent, r, r, 0.9, x, SLAB + 0.45, z, mat || MAT.wood, 18);
+for (var i = 0; i < chairs; i++) {
+var a = (i / chairs) * Math.PI * 2;
+var cxp = x + Math.cos(a) * (r + 1.5), czp = z + Math.sin(a) * (r + 1.5);
+bx(parent, 1.5, 1.1, 1.5, cxp, SLAB + 0.55, czp, MAT.woodDark);
+}
+}
+function shelfWall(parent, len, x, z, ry) {
+parent.add(bx(parent, len, 1.9, 0.5, x, SLAB + 0.95, z, MAT.woodDark, ry));
+for (var i = -1; i <= 1; i++) {
+parent.add(bx(parent, len, 0.12, 0.62, x, SLAB + 0.95 + i * 0.5, z, MAT.wood, ry));
+}
+}
+function plant(parent, x, z) {
+cy(parent, 0.5, 0.6, 1.2, x, SLAB + 0.6, z, MAT.dark, 8);
+var m = new THREE.Mesh(new THREE.SphereGeometry(1.1, 8, 6), MAT.green);
+m.position.set(x, SLAB + 1.9, z);
+parent.add(m);
+}
+var BUILDERS = [
+function (g) {
+shell(g); core(g, 2);
+for (var i = 0; i < 8; i++) {
+var a = i * Math.PI / 4 + Math.PI / 4;
+cy(g, 0.8, 1.1, 6.4, Math.cos(a) * 13.5, SLAB + 3.2, Math.sin(a) * 13.5, MAT.wall, 10);
+}
+bx(g, 15, 1.7, 2.6, -3, SLAB + 0.85, -13, MAT.woodDark);
+bx(g, 2.6, 1.7, 8, 4.2, SLAB + 0.85, -10.2, MAT.woodDark);
+bx(g, 16, 3, 0.5, -3, SLAB + 1.5, -16.5, MAT.wall);
+sofa(g, -12, 4, Math.PI / 2, MAT.cloth);
+sofa(g, -12, -4, Math.PI / 2, MAT.cloth2);
+bx(g, 3.4, 0.7, 2, -7.6, SLAB + 0.35, 0, MAT.wood);
+tableSet(g, 13, 6, 2.4, 3, MAT.wood);
+plant(g, 12, -13); plant(g, 16, -6); plant(g, 6, 12);
+},
+function (g) {
+shell(g); core(g, 1);
+bx(g, 30, 0.9, 2.8, 0, SLAB + 0.45, 13.5, MAT.wood);
+for (var i = -6; i <= 6; i++) {
+bx(g, 1.5, 1.2, 1.5, i * 2.1, SLAB + 0.6, 11.4, MAT.woodDark);
+bx(g, 1.5, 1.2, 1.5, i * 2.1, SLAB + 0.6, 15.6, MAT.woodDark);
+}
+bx(g, 6, 1.4, 12, -16.5, SLAB + 0.7, 0, MAT.woodDark);
+bx(g, 0.6, 5, 12, -19.4, SLAB + 2.5, 0, MAT.cloth2);
+bx(g, 16, 1.5, 2.2, 0, SLAB + 0.75, -15.5, MAT.woodDark);
+tableSet(g, 9, -6, 2.8, 4, MAT.wood);
+tableSet(g, 15, 4, 2.8, 4, MAT.wood);
+tableSet(g, -10, -13, 2.4, 3, MAT.wood);
+plant(g, 17, -12); plant(g, 4, -12);
+},
+function (g) {
+shell(g); core(g, 1);
+shelfWall(g, 34, 0, 18.4, 0);
+shelfWall(g, 34, 0, -18.4, 0);
+shelfWall(g, 34, 18.4, 0, Math.PI / 2);
+shelfWall(g, 34, -18.4, 0, Math.PI / 2);
+bx(g, 9, 1, 0.5, -11, SLAB + 0.5, -9, MAT.woodDark);
+bx(g, 0.5, 2.6, 9, -15.4, SLAB + 1.3, -13.4, MAT.wall);
+bx(g, 9, 2.6, 0.5, -11, SLAB + 1.3, -17.9, MAT.wall);
+bx(g, 0.5, 2.6, 9, -6.6, SLAB + 1.3, -13.4, MAT.wall);
+bx(g, 7, 0.8, 3, 8, SLAB + 0.4, -4, MAT.wood);
+bx(g, 7, 0.8, 3, 8, SLAB + 0.4, 4, MAT.wood);
+bx(g, 7, 0.8, 3, 13, SLAB + 0.4, 12, MAT.wood);
+cy(g, 1.6, 1.6, 0.5, 8, SLAB + 1.05, -4, MAT.dark, 14);
+cy(g, 1.6, 1.6, 0.5, 8, SLAB + 1.05, 4, MAT.dark, 14);
+cy(g, 1.6, 1.6, 0.5, 13, SLAB + 1.05, 12, MAT.dark, 14);
+plant(g, 16, -16); plant(g, -16, 16);
+},
+function (g) {
+shell(g); core(g, 1);
+for (var i = 0; i < 3; i++) {
+bed(g, -6 + i * 7, 15, 0, MAT.white);
+}
+bx(g, 21, 2.4, 0.4, 0, SLAB + 1.2, 12.4, MAT.glass);
+bx(g, 0.4, 2.4, 6, -9.5, SLAB + 1.2, 15, MAT.glass);
+bx(g, 0.4, 2.4, 6, 9.5, SLAB + 1.2, 15, MAT.glass);
+bx(g, 12, 2.4, 1.6, -13, SLAB + 1.2, -14, MAT.white);
+for (var d = 0; d < 4; d++) {
+bx(g, 11, 0.12, 1.8, -13, SLAB + 0.7 + d * 0.55, -14, MAT.tile);
+}
+bx(g, 6, 1.1, 3, 12, SLAB + 0.55, -12, MAT.tile);
+cy(g, 1.2, 1.2, 0.4, 12, SLAB + 1.15, -12, MAT.metal, 12);
+bx(g, 9, 2.4, 0.4, 12, SLAB + 1.2, -16.2, MAT.glass);
+bx(g, 9, 1.1, 3, 12, SLAB + 0.55, 6, MAT.tile);
+bx(g, 3.4, 1.1, 0.6, 12, SLAB + 1.6, 4.5, MAT.metal);
+plant(g, 16, 14);
+},
+function (g) {
+shell(g); core(g, 1);
+bx(g, 20, 1.2, 3.4, 0, SLAB + 0.6, -10, MAT.metal);
+for (var i = -1; i <= 1; i++) {
+cy(g, 1, 1, 0.2, i * 5, SLAB + 1.25, -10, MAT.dark, 12);
+}
+bx(g, 2, 1.2, 14, -16.5, SLAB + 0.6, 2, MAT.metal);
+bx(g, 14, 1.2, 2, 4, SLAB + 0.6, 16.8, MAT.metal);
+bx(g, 8, 2.6, 5, 14, SLAB + 1.3, -13, MAT.white);
+bx(g, 7.4, 2.2, 0.4, 14, SLAB + 1.1, -10.4, MAT.cold);
+bx(g, 8, 2.6, 5, 14, SLAB + 1.3, -4, MAT.white);
+bx(g, 7.4, 2.2, 0.4, 14, SLAB + 1.1, -6.6, MAT.cold);
+shelfWall(g, 20, -2, 11.5, 0);
+shelfWall(g, 20, -2, 15.5, 0);
+shelfWall(g, 16, -15, 15.5, Math.PI / 2);
+plant(g, 8, 12); plant(g, 17, 8);
+},
+function (g) {
+shell(g); core(g, 1);
+bx(g, 20, 6.4, 0.6, -12, SLAB + 3.2, 17.6, MAT.screen);
+for (var r2 = 0; r2 < 4; r2++) {
+bx(g, 22, 0.6 + r2 * 0.45, 2.6, -8, SLAB + 0.3 + r2 * 0.23, 8 + r2 * 3, MAT.dark);
+for (var c = -4; c <= 4; c++) {
+bx(g, 1.6, 0.9, 1.6, -8 + c * 2.2, SLAB + 0.9 + r2 * 0.45, 8 + r2 * 3, MAT.cloth);
+}
+}
+bx(g, 10, 2.6, 0.4, 12, SLAB + 1.3, 16.4, MAT.wall);
+bx(g, 0.4, 2.6, 8, 7, SLAB + 1.3, 12.5, MAT.wall);
+bx(g, 5, 1.1, 2.6, 11, SLAB + 0.55, 13, MAT.metal);
+bx(g, 12, 1.1, 5, 8, SLAB + 0.55, -6, MAT.green);
+cy(g, 1.6, 1.6, 0.6, 8, SLAB + 1.15, -2, MAT.dark, 14);
+bx(g, 6, 1.1, 2.6, -12, SLAB + 0.55, -6, MAT.metal);
+plant(g, -16, -14);
+},
+function (g) {
+shell(g); core(g, 1);
+bx(g, 16, 0.7, 9, 0, SLAB + 0.35, -12, MAT.tile);
+bx(g, 14, 0.5, 7, 0, SLAB + 0.55, -12, MAT.water);
+for (var l = -1; l <= 1; l++) {
+bx(g, 13, 0.1, 0.25, 0, SLAB + 0.85, -12 + l * 2.4, MAT.white);
+}
+bx(g, 18, 1, 1, 0, SLAB + 0.5, -17.5, MAT.tile);
+bx(g, 18, 1, 1, 0, SLAB + 0.5, -6.5, MAT.tile);
+for (var m2 = 0; m2 < 4; m2++) {
+bx(g, 3, 1.2, 4, 8 + m2 * 3.4, SLAB + 0.6, 2, MAT.dark);
+bx(g, 2, 1.8, 0.6, 8 + m2 * 3.4, SLAB + 1.5, 3.4, MAT.metal);
+}
+bx(g, 12, 2.2, 1.6, -13, SLAB + 1.1, 12, MAT.metal);
+for (var lk = 0; lk < 6; lk++) {
+bx(g, 1.7, 2.2, 1.4, -17.4 + lk * 1.9, SLAB + 1.1, 16, MAT.metal);
+}
+for (var mt = 0; mt < 4; mt++) {
+bx(g, 2.6, 0.25, 5, -14 + mt * 3.2, SLAB + 0.42, -2, MAT.cloth2);
+}
+plant(g, 17, 12);
+},
+function (g) {
+shell(g); core(g, 1);
+var sides = [[0, 1], [0, -1]];
+for (var si = 0; si < 2; si++) {
+var zn = sides[si][1];
+var zc = zn * 12;
+bx(g, 22, 0.35, 2.6, 0, SLAB + 0.2, zn * 8.4, MAT.tile);
+bx(g, 9, 2.4, 0.4, -7, SLAB + 1.2, zn * 6.6, MAT.wall);
+bx(g, 0.4, 2.4, 3, -11.5, SLAB + 1.2, zn * 8, MAT.wall);
+sofa(g, -13, zc, zn > 0 ? Math.PI : 0, MAT.cloth);
+bx(g, 3, 0.7, 1.8, -13, SLAB + 0.35, zc + zn * 3.4, MAT.wood);
+bed(g, 8, zc, zn > 0 ? Math.PI : 0, MAT.white);
+bx(g, 1.6, 1.1, 1.6, 4.6, SLAB + 0.55, zn * 13, MAT.woodDark);
+bx(g, 1.6, 1.1, 1.6, 11.4, SLAB + 0.55, zn * 13, MAT.woodDark);
+bx(g, 4.4, 2.4, 0.4, 16, SLAB + 1.2, zn * 9.4, MAT.glass);
+bx(g, 2.2, 0.9, 4.4, 17.4, SLAB + 0.45, zn * 9.4, MAT.tile);
+cy(g, 1, 1, 0.5, 17.4, SLAB + 1.15, zn * 9.4, MAT.white, 12);
+bx(g, 12, 0.5, 5, 8, SLAB + 0.25, zn * (HALF_P + 2.6), MAT.slabTop);
+bx(g, 12, 1.2, 0.4, 8, SLAB + 1.1, zn * (HALF_P + 5), MAT.wall);
+bx(g, 0.4, 1.2, 5, 2, SLAB + 1.1, zn * (HALF_P + 2.6), MAT.wall);
+bx(g, 0.4, 1.2, 5, 14, SLAB + 1.1, zn * (HALF_P + 2.6), MAT.wall);
+}
+for (var rf = -1; rf <= 1; rf += 2) {
+bx(g, 0.5, 0.12, 12, rf * 10.6, SLAB + 0.1, 0, MAT.tile);
+bx(g, 12, 0.12, 0.5, 0, SLAB + 0.1, rf * 10.6, MAT.tile);
+}
+plant(g, 18, 8);
+plant(g, -18, -8);
+}
+];
+var FLOOR_INFO = [
+{ name: '1F 大堂 · 前厅', note: '门廊 · 接待台 · 等候区 · 值班室 · 电梯厅' },
+{ name: '2F 宴会厅 · 餐厅', note: '长桌宴席 · 西侧舞台 · 备餐吧台 · 露台' },
+{ name: '3F 图书室', note: '环墙书架 · 三张阅览桌 · 西侧档案暗间' },
+{ name: '4F 医务室 · 观察室', note: '三张病床 · 药柜 · 洗手台 · 玻璃隔断' },
+{ name: '5F 厨房 · 储藏', note: '中岛灶台 · 两间冷库 · 储物架 · 配餐通道' },
+{ name: '6F 放映厅 · 游戏室', note: '四排阶梯座 · 银幕 · 放映间 · 台球与棋牌' },
+{ name: '7F 健身房 · 泳池', note: '十六米泳池 · 器械区 · 更衣柜 · 瑜伽垫' },
+{ name: '12F 客房层（8–14F 代表层）', note: '环廊 · 801 套间（客厅+卧室+卫浴）· 802 套间 · 南北露台' }
+];
+function makeLabel(text) {
+var fs = 40, pad = 16;
+var probe = document.createElement('canvas').getContext('2d');
+var font = '500 ' + fs + 'px system-ui, "Segoe UI", "Microsoft YaHei", sans-serif';
+probe.font = font;
+var w = Math.ceil(probe.measureText(text).width) + pad * 2;
+var c = document.createElement('canvas');
+c.width = w; c.height = fs + pad * 2;
+var g = c.getContext('2d');
+g.font = font;
+var r = c.height / 2;
+var bg = new THREE.Color(THEME.bg);
+g.fillStyle = 'rgba(' + Math.round(bg.r * 255) + ',' + Math.round(bg.g * 255) + ',' + Math.round(bg.b * 255) + ',0.8)';
+g.beginPath();
+g.moveTo(r, 0); g.lineTo(c.width - r, 0);
+g.arcTo(c.width, 0, c.width, r, r);
+g.lineTo(c.width, c.height - r);
+g.arcTo(c.width, c.height, c.width - r, c.height, r);
+g.lineTo(r, c.height);
+g.arcTo(0, c.height, 0, c.height - r, r);
+g.lineTo(0, r);
+g.arcTo(0, 0, r, 0, r);
+g.closePath(); g.fill();
+g.fillStyle = THEME.fg;
+g.textBaseline = 'middle';
+g.fillText(text, pad, c.height / 2 + 2);
+var tex = new THREE.CanvasTexture(c);
+tex.encoding = THREE.sRGBEncoding;
+var sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, transparent: true, depthTest: false, depthWrite: false }));
+sp.scale.set(26, 26 * c.height / c.width, 1);
+return sp;
+}
+var GRID_X = [-105, -35, 35, 105];
+var GRID_Z = [-38, 38];
+for (var fi = 0; fi < BUILDERS.length; fi++) {
+var info = FLOOR_INFO[fi];
+var plate = new THREE.Group();
+var homeX = GRID_X[fi % 4], homeZ = GRID_Z[Math.floor(fi / 4)];
+plate.position.set(homeX, 0, homeZ);
+plate.userData.homeX = homeX;
+plate.userData.homeZ = homeZ;
+plate.userData.tx = homeX;
+plate.userData.tz = homeZ;
+plate.userData.ts = 1;
+var struct = new THREE.Group();
+var props = new THREE.Group();
+plate.add(struct, props);
+var pick = slabFor(struct);
+pick.userData.plate = fi;
+pickTargets.push(pick);
+STRUCT = struct;
+BUILDERS[fi](props);
+STRUCT = null;
+var labelGroup = new THREE.Group();
+var sp2 = makeLabel(info.name);
+sp2.position.set(0, PLATE * 0.30, -HALF_P - 6);
+labelGroup.add(sp2);
+plate.add(labelGroup);
+plate.userData.struct = struct;
+plate.userData.props = props;
+plate.userData.labels = labelGroup;
+world.add(plate);
+plates.push(plate);
+}
+var state = { props: true, labels: true, grid: true, spin: false };
+var focus = -1;
+var VIEW_ALL = { pos: [70, 185, 265], target: [0, 0, 0] };
+var VIEW_ONE = { pos: [0, 96, 108], target: [0, 0, 0] };
+var tween = null;
+function flyTo(v, ms) {
+var toPos = new THREE.Vector3(v.pos[0], v.pos[1], v.pos[2]);
+var toTarget = new THREE.Vector3(v.target[0], v.target[1], v.target[2]);
+if (reduceMotion) {
+camera.position.copy(toPos);
+controls.target.copy(toTarget);
+controls.update();
+tween = null;
+return;
+}
+tween = { t0: performance.now(), ms: ms || 700, fromPos: camera.position.clone(), toPos: toPos, fromTarget: controls.target.clone(), toTarget: toTarget };
+}
+function applyFocus(instant) {
+plates.forEach(function (p, i) {
+var on = focus < 0 || i === focus;
+p.visible = on;
+var tx = on ? (focus < 0 ? p.userData.homeX : 0) : p.userData.tx;
+var tz = on ? (focus < 0 ? p.userData.homeZ : 0) : p.userData.tz;
+var ts = on ? (focus < 0 ? 1 : 1.9) : p.userData.ts;
+p.userData.tx = tx; p.userData.tz = tz; p.userData.ts = ts;
+if (instant) { p.position.set(tx, 0, tz); p.scale.set(ts, ts, ts); }
+});
+}
+function apply() {
+plates.forEach(function (p) {
+p.userData.props.visible = state.props && (focus < 0 || p.visible);
+p.userData.labels.visible = state.labels;
+});
+grid.visible = state.grid;
+controls.autoRotate = state.spin && !reduceMotion;
+}
+var floorButtons = root.querySelectorAll('[data-plans-floor]');
+Array.prototype.forEach.call(floorButtons, function (btn) {
+btn.addEventListener('click', function () {
+Array.prototype.forEach.call(floorButtons, function (b) {
+b.classList.toggle('btn-primary', b === btn);
+b.setAttribute('aria-pressed', b === btn ? 'true' : 'false');
+});
+focus = Number(btn.getAttribute('data-plans-floor'));
+applyFocus(false);
+apply();
+flyTo(focus < 0 ? VIEW_ALL : VIEW_ONE, 700);
+});
+});
+var toggleButtons = root.querySelectorAll('[data-plans-toggle]');
+Array.prototype.forEach.call(toggleButtons, function (btn) {
+btn.addEventListener('click', function () {
+var k = btn.getAttribute('data-plans-toggle');
+state[k] = !state[k];
+btn.setAttribute('aria-pressed', state[k] ? 'true' : 'false');
+apply();
+});
+});
+var raycaster = new THREE.Raycaster();
+var pointer = new THREE.Vector2();
+canvas.addEventListener('pointerdown', function () { tween = null; });
+canvas.addEventListener('pointermove', function (e) {
+var rect = canvas.getBoundingClientRect();
+pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+pointer.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+raycaster.setFromCamera(pointer, camera);
+var hits = raycaster.intersectObjects(pickTargets, false);
+if (hits.length) {
+var idx = hits[0].object.userData.plate;
+tipEl.textContent = FLOOR_INFO[idx].name + ' · ' + FLOOR_INFO[idx].note;
+tipEl.style.left = (e.clientX - rect.left) + 'px';
+tipEl.style.top = (e.clientY - rect.top) + 'px';
+tipEl.style.opacity = '1';
+} else {
+tipEl.style.opacity = '0';
+}
+});
+canvas.addEventListener('pointerleave', function () { tipEl.style.opacity = '0'; });
+canvas.addEventListener('click', function (e) {
+var rect = canvas.getBoundingClientRect();
+pointer.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+pointer.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+raycaster.setFromCamera(pointer, camera);
+var hits = raycaster.intersectObjects(pickTargets, false);
+if (!hits.length) return;
+var idx = hits[0].object.userData.plate;
+Array.prototype.forEach.call(floorButtons, function (b) {
+var on = Number(b.getAttribute('data-plans-floor')) === idx;
+b.classList.toggle('btn-primary', on);
+b.setAttribute('aria-pressed', on ? 'true' : 'false');
+});
+focus = focus === idx ? -1 : idx;
+applyFocus(false);
+apply();
+flyTo(focus < 0 ? VIEW_ALL : VIEW_ONE, 650);
+});
+function resize() {
+var w = stage.clientWidth || 640;
+var h = stage.clientHeight || Math.round(w * 0.625);
+renderer.setSize(w, h, false);
+camera.aspect = w / h;
+camera.updateProjectionMatrix();
+}
+if (window.ResizeObserver) new ResizeObserver(resize).observe(stage);
+else window.addEventListener('resize', resize);
+resize();
+function frame(now) {
+if (tween) {
+var k = Math.min(1, (now - tween.t0) / tween.ms);
+var e2 = k < 0.5 ? 2 * k * k : -1 + (4 - 2 * k) * k;
+camera.position.lerpVectors(tween.fromPos, tween.toPos, e2);
+controls.target.lerpVectors(tween.fromTarget, tween.toTarget, e2);
+if (k >= 1) tween = null;
+}
+plates.forEach(function (p) {
+if (!p.visible) return;
+p.position.x += (p.userData.tx - p.position.x) * 0.22;
+p.position.z += (p.userData.tz - p.position.z) * 0.22;
+var s = p.scale.x + (p.userData.ts - p.scale.x) * 0.22;
+p.scale.set(s, s, s);
+});
+controls.update();
+renderer.render(scene, camera);
+requestAnimationFrame(frame);
+}
+applyFocus(true);
+apply();
+requestAnimationFrame(frame);
+})();
+</script>
+</div>
